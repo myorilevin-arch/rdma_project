@@ -12,8 +12,8 @@ typedef struct RDMAContext
   struct ibv_context *ctx;
   struct ibv_pd *pd;
   struct ibv_cq *cq;
-  struct ibv_qp * right_qp;
-  struct ibv_qp * left_qp;
+  struct ibv_qp * qp_to_right;
+  struct ibv_qp * qp_from_left;
 
   uint16_t lid;
   uint8_t port_num;

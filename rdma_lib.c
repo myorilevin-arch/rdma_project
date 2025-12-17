@@ -6,7 +6,7 @@
 #include <unistd.h>
 #include <sys/socket.h>
 
-void get_neighbors(char *servername, char (*my_hostname)[256], char *(*hosts_array)[100], int *right_neighbor_index)
+void get_neighbors(const char *servername, char (*my_hostname)[256], char *(*hosts_array)[100], int *right_neighbor_index)
 {
   gethostname(*my_hostname, HOSTNAME_MAX);
   char *servername_copy = strdup(servername);
@@ -62,7 +62,6 @@ int build_rdma_context(RDMAContext *context)
     return EXIT_FAILURE;
   }
   struct ibv_qp_init_attr qp_attr = {0};
-  // memset(&qp_attr, 0, sizeof(qp_attr));
   qp_attr.send_cq = context->cq;
   qp_attr.recv_cq = context->cq;
   qp_attr.qp_type = IBV_QPT_RC;
@@ -71,14 +70,14 @@ int build_rdma_context(RDMAContext *context)
   qp_attr.cap.max_send_sge = 1;
   qp_attr.cap.max_recv_sge = 1;
 
-  context->right_qp = ibv_create_qp(context->pd, &qp_attr);
-  if (!context->right_qp)
+  context->qp_to_right = ibv_create_qp(context->pd, &qp_attr);
+  if (!context->qp_to_right)
   {
     perror("Failed to create Right QP");
     return EXIT_FAILURE;
   }
-  context->left_qp = ibv_create_qp(context->pd, &qp_attr);
-  if (!context->left_qp)
+  context->qp_from_left = ibv_create_qp(context->pd, &qp_attr);
+  if (!context->qp_from_left)
   {
     perror("Failed to create Left QP");
     return EXIT_FAILURE;
@@ -97,7 +96,62 @@ int build_rdma_context(RDMAContext *context)
 
 int modify_qp_to_rts(struct ibv_qp *qp, uint32_t remote_qpn, uint16_t remote_lid)
 {
+  // from reset to init
+  struct ibv_qp_attr attr = {0};
+  attr.qp_state = IBV_QPS_INIT;
+  attr.port_num = 1;
+  attr.pkey_index = 0;
+  attr.qp_access_flags = IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_LOCAL_WRITE;
 
+  int flags = IBV_QP_STATE | IBV_QP_PORT | IBV_QP_PKEY_INDEX | IBV_QP_ACCESS_FLAGS;
+
+  if (ibv_modify_qp(qp, &attr, flags))
+  {
+    perror("Failed to modify QP to INIT");
+    return EXIT_FAILURE;
+  }
+
+  // from init to rtr
+  memset(&attr, 0, sizeof(attr));
+  attr.qp_state = IBV_QPS_RTR;
+  attr.dest_qp_num = remote_qpn;
+  attr.ah_attr = (struct ibv_ah_attr){
+    .is_global = 0,
+    .dlid = remote_lid,
+    .port_num = 1
+  };
+  attr.path_mtu = IBV_MTU_1024;
+  attr.rq_psn = 0;
+  attr.max_dest_rd_atomic = 1;
+  attr.min_rnr_timer = 12;
+
+  flags = IBV_QP_STATE | IBV_QP_DEST_QPN | IBV_QP_AV | IBV_QP_PATH_MTU |
+          IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
+
+  if (ibv_modify_qp(qp, &attr, flags))
+  {
+    perror("Failed to modify QP to RTR");
+    return EXIT_FAILURE;
+  }
+
+  // from rtr to rts
+  memset(&attr, 0, sizeof(attr));
+  attr.qp_state = IBV_QPS_RTS;
+  attr.sq_psn = 0;
+  attr.timeout = 14;
+  attr.retry_cnt = 7;
+  attr.rnr_retry = 7;
+  attr.max_rd_atomic = 1;
+
+  flags = IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT |
+          IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY | IBV_QP_MAX_QP_RD_ATOMIC;
+
+  if (ibv_modify_qp(qp, &attr, flags))
+  {
+    perror("Failed to modify QP to RTS");
+    return EXIT_FAILURE;
+  }
+  return EXIT_SUCCESS;
 }
 
 int connect_process_group(char *servername, void **pg_handle)
@@ -146,7 +200,7 @@ int connect_process_group(char *servername, void **pg_handle)
     exit(EXIT_FAILURE);
   }
 
-  RDMA_exchange_info info_to_neighbors = {rdma_context.lid, rdma_context.left_qp->qp_num};
+  RDMA_exchange_info info_to_neighbors = {rdma_context.lid, rdma_context.qp_from_left->qp_num};
   RDMA_exchange_info info_from_right_neighbor;
   RDMA_exchange_info info_from_left_neighbor;
 
@@ -170,8 +224,20 @@ int connect_process_group(char *servername, void **pg_handle)
   printf("  <- My hostname: %s, I got from LEFT: LID %d, QPN %d\n", my_hostname, info_from_left_neighbor.lid, info_from_left_neighbor.qp_num);
   printf("  <- My hostname: %s, I got from RIGHT: LID %d, QPN %d\n", my_hostname, info_from_right_neighbor.lid, info_from_right_neighbor.qp_num);
 
+  close(left_fd);
+  close(right_fd);
+  close(listen_fd);
 
-
+  if (modify_qp_to_rts(rdma_context.qp_from_left, info_from_left_neighbor.qp_num, info_from_left_neighbor.lid) != 0)
+  {
+    fprintf(stderr, "Failed to modify Left QP to RTS\n");
+    exit(EXIT_FAILURE);
+  }
+  if (modify_qp_to_rts(rdma_context.qp_to_right, info_from_right_neighbor.qp_num, info_from_right_neighbor.lid) != 0)
+  {
+    fprintf(stderr, "Failed to modify Right QP to RTS\n");
+    exit(EXIT_FAILURE);
+  }
 
   return 0;
 }
