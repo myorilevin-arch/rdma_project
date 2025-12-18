@@ -161,8 +161,6 @@ int setup_tcp_connection()
 }
 int connect_process_group(char *servername, void **pg_handle)
 {
-  pg_handle = (RDMAContext) pg_handle;
-
   char my_hostname[256];
   char *hosts_array[100];
   int right_neighbor_index;
@@ -200,13 +198,15 @@ int connect_process_group(char *servername, void **pg_handle)
   right_addr->sin_family = AF_INET;
   right_addr->sin_port = htons(PORT_BASE);
 
-  if (build_rdma_context(pg_handle) != 0)
+  RDMAContext *rdma_context = malloc(sizeof(RDMAContext));
+  memset(rdma_context, 0, sizeof(RDMAContext));
+  if (build_rdma_context(rdma_context) != 0)
   {
     fprintf(stderr, "Failed to build RDMA context\n");
     return EXIT_FAILURE;
   }
 
-  RDMA_exchange_info info_to_neighbors = {pg_handle.lid, pg_handle.qp_from_left->qp_num};
+  RDMA_exchange_info info_to_neighbors = {rdma_context->lid, rdma_context->qp_from_left->qp_num};
   RDMA_exchange_info info_from_right_neighbor;
   RDMA_exchange_info info_from_left_neighbor;
 
@@ -234,18 +234,18 @@ int connect_process_group(char *servername, void **pg_handle)
   close(right_fd);
   close(listen_fd);
 
-  if (modify_qp_to_rts(pg_handle.qp_from_left, info_from_left_neighbor.qp_num, info_from_left_neighbor.lid) != 0)
+  if (modify_qp_to_rts(rdma_context->qp_from_left, info_from_left_neighbor.qp_num, info_from_left_neighbor.lid) != 0)
   {
     fprintf(stderr, "Failed to modify Left QP to RTS\n");
     return EXIT_FAILURE;
   }
-  if (modify_qp_to_rts(pg_handle.qp_to_right, info_from_right_neighbor.qp_num, info_from_right_neighbor.lid) != 0)
+  if (modify_qp_to_rts(rdma_context->qp_to_right, info_from_right_neighbor.qp_num, info_from_right_neighbor.lid) != 0)
   {
     fprintf(stderr, "Failed to modify Right QP to RTS\n");
     return EXIT_FAILURE;
   }
 
-  *pg_handle = pg_handle.ctx;
+  *pg_handle = rdma_context;
 
   return 0;
 }
