@@ -154,8 +154,15 @@ int modify_qp_to_rts(struct ibv_qp *qp, uint32_t remote_qpn, uint16_t remote_lid
   return EXIT_SUCCESS;
 }
 
+
+int setup_tcp_connection()
+{
+  return EXIT_SUCCESS;
+}
 int connect_process_group(char *servername, void **pg_handle)
 {
+  pg_handle = (RDMAContext) pg_handle;
+
   char my_hostname[256];
   char *hosts_array[100];
   int right_neighbor_index;
@@ -176,7 +183,7 @@ int connect_process_group(char *servername, void **pg_handle)
   {
     perror("bind");
     close(listen_fd);
-    exit(EXIT_FAILURE);
+    return EXIT_FAILURE;
   }
 
   listen(listen_fd, 1);
@@ -185,7 +192,7 @@ int connect_process_group(char *servername, void **pg_handle)
   if (getaddrinfo(hosts_array[right_neighbor_index], NULL, NULL, &right_neighbor_info) != 0)
   {
     fprintf(stderr, "Failed to get address info for right neighbor %s\n", hosts_array[right_neighbor_index]);
-    exit(EXIT_FAILURE);
+    return EXIT_FAILURE;
   }
 
   int right_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -193,14 +200,13 @@ int connect_process_group(char *servername, void **pg_handle)
   right_addr->sin_family = AF_INET;
   right_addr->sin_port = htons(PORT_BASE);
 
-  RDMAContext rdma_context;
-  if (build_rdma_context(&rdma_context) != 0)
+  if (build_rdma_context(pg_handle) != 0)
   {
     fprintf(stderr, "Failed to build RDMA context\n");
-    exit(EXIT_FAILURE);
+    return EXIT_FAILURE;
   }
 
-  RDMA_exchange_info info_to_neighbors = {rdma_context.lid, rdma_context.qp_from_left->qp_num};
+  RDMA_exchange_info info_to_neighbors = {pg_handle.lid, pg_handle.qp_from_left->qp_num};
   RDMA_exchange_info info_from_right_neighbor;
   RDMA_exchange_info info_from_left_neighbor;
 
@@ -228,16 +234,18 @@ int connect_process_group(char *servername, void **pg_handle)
   close(right_fd);
   close(listen_fd);
 
-  if (modify_qp_to_rts(rdma_context.qp_from_left, info_from_left_neighbor.qp_num, info_from_left_neighbor.lid) != 0)
+  if (modify_qp_to_rts(pg_handle.qp_from_left, info_from_left_neighbor.qp_num, info_from_left_neighbor.lid) != 0)
   {
     fprintf(stderr, "Failed to modify Left QP to RTS\n");
-    exit(EXIT_FAILURE);
+    return EXIT_FAILURE;
   }
-  if (modify_qp_to_rts(rdma_context.qp_to_right, info_from_right_neighbor.qp_num, info_from_right_neighbor.lid) != 0)
+  if (modify_qp_to_rts(pg_handle.qp_to_right, info_from_right_neighbor.qp_num, info_from_right_neighbor.lid) != 0)
   {
     fprintf(stderr, "Failed to modify Right QP to RTS\n");
-    exit(EXIT_FAILURE);
+    return EXIT_FAILURE;
   }
+
+  *pg_handle = pg_handle.ctx;
 
   return 0;
 }
