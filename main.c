@@ -71,5 +71,7 @@ int main(int argc, char *argv[])
   ibv_dereg_mr(mr_recv);
   ibv_dereg_mr(mr_send);
 
+  free(pg);
+
   return 0;
 }

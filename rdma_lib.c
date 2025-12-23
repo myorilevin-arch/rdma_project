@@ -248,7 +248,6 @@ int connect_process_group(char *servername, void **pg_handle)
   exchange_rdma_info(&tcp_ctx, my_ctx, &neighbors_info);
   // freeaddrinfo(right_neighbor_info);
 
-
   // todo - delete later!
   printf("Exchange Done!\n");
   char my_hostname[256];
@@ -272,4 +271,121 @@ int connect_process_group(char *servername, void **pg_handle)
   *pg_handle = my_ctx;
 
   return 0;
+}
+
+// TODO - check if conversion can be done once at the beginning of the function rather than before each operation
+void perform_operation(DATATYPE datatype, OPERATION op, void *recv_buf, void *incoming_buf, int count)
+{
+  switch (datatype)
+  {
+    case INT:
+      switch (op)
+      {
+        case SUM:
+          for (int i = 0; i < count; i++)
+          {
+            ((int *) recv_buf)[i] += ((int *) incoming_buf)[i];
+          }
+          break;
+        case MAX:
+          for (int i = 0; i < count; i++)
+          {
+            if (((int *) incoming_buf)[i] > ((int *) recv_buf)[i])
+            {
+              ((int *) recv_buf)[i] = ((int *) incoming_buf)[i];
+            }
+          }
+          break;
+        case MULT:
+          for (int i = 0; i < count; i++)
+          {
+            ((int *) recv_buf)[i] *= ((int *) incoming_buf)[i];
+          }
+          break;
+      }
+      break;
+    case DOUBLE:
+      switch (op)
+      {
+        case SUM:
+          for (int i = 0; i < count; i++)
+          {
+            ((double *) recv_buf)[i] += ((double *) incoming_buf)[i];
+          }
+          break;
+        case MAX:
+          for (int i = 0; i < count; i++)
+          {
+            if (((double *) incoming_buf)[i] > ((double *) recv_buf)[i])
+              ((double *) recv_buf)[i] = ((double *) incoming_buf)[i];
+          }
+          break;
+        case MULT:
+          for (int i = 0; i < count; i++)
+          {
+            ((double *) recv_buf)[i] *= ((double *) incoming_buf)[i];
+          }
+          break;
+      }
+      break;
+  }
+}
+
+int sizeof_datatype(DATATYPE datatype)
+{
+  switch (datatype)
+  {
+    case INT:
+      return sizeof(int);
+    case DOUBLE:
+      return sizeof(double);
+    default:
+      return 0;
+  }
+}
+
+int pg_reduce_scatter(void *sendbuf, void *recvbuf, int obj_count, DATATYPE datatype, OPERATION op, void *pg_handle)
+{
+  if (sendbuf != recvbuf)
+  {
+    memccpy(recvbuf, sendbuf, '\0', obj_count * sizeof_datatype(datatype));
+  }
+  RDMAContext *pg = (RDMAContext *) pg_handle;
+  struct ibv_mr *mr_recv = ibv_reg_mr(pg->pd, recvbuf, obj_count * sizeof_datatype(datatype), IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+  if (!mr_recv)
+  {
+    fprintf(stderr, "Failed to register memory region for recv\n");
+    return EXIT_FAILURE;
+  }
+  int chunk_size = obj_count / pg->servers_num;
+  char temp_incoming_buf[chunk_size * sizeof_datatype(datatype)];
+  struct ibv_mr *mr_temp = ibv_reg_mr(pg->pd, temp_incoming_buf, chunk_size * sizeof_datatype(datatype),
+                                      IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+  if (!mr_temp)
+  {
+    fprintf(stderr, "Failed to register memory region for temp buffer\n");
+    return EXIT_FAILURE;
+  }
+  for (int i = 0; i < pg->servers_num; i++)
+  {
+    int send_index = (pg->my_index - i + pg->servers_num) % pg->servers_num;
+    int recv_index = (pg->my_index - i - 1 + pg->servers_num) % pg->servers_num;
+
+    // Post receive
+    struct ibv_sge recv_sge = {.addr = (uintptr_t) (temp_incoming_buf), .length = chunk_size * sizeof_datatype(datatype), .lkey = mr_temp->lkey};
+    struct ibv_recv_wr recv_wr = {.wr_id = 1, .next = NULL, .sg_list = &recv_sge, .num_sge = 1};
+    ibv_post_recv(pg->qp_from_left, &recv_wr, NULL);
+
+    // Post send
+    struct ibv_sge send_sge = {
+      .addr = (uintptr_t) (recvbuf) + send_index * chunk_size * sizeof_datatype(datatype), .length = chunk_size * sizeof_datatype(datatype),
+      .lkey = mr_recv->lkey
+    };
+    struct ibv_send_wr send_wr = {
+      .wr_id = 2, .next = NULL, .sg_list = &send_sge, .num_sge = 1, .opcode = IBV_WR_SEND, .send_flags = IBV_SEND_SIGNALED
+    };
+    ibv_post_send(pg->qp_to_right, &send_wr, NULL);
+  }
+
+  return EXIT_SUCCESS;
 }
