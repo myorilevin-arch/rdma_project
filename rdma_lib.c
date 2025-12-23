@@ -27,7 +27,6 @@ void get_neighbors(const char *servername, char (*my_hostname)[256], char *(*hos
     }
   }
   *right_neighbor_index = (my_hostname_index + 1) % servers_count;
-  // int left_neighbor_index = (my_hostname_index - 1 + servers_count) % servers_count;
 }
 
 int build_rdma_context(RDMAContext *context)
@@ -154,37 +153,30 @@ int modify_qp_to_rts(struct ibv_qp *qp, uint32_t remote_qpn, uint16_t remote_lid
   return EXIT_SUCCESS;
 }
 
-
-int setup_tcp_connection()
-{
-  return EXIT_SUCCESS;
-}
-int connect_process_group(char *servername, void **pg_handle)
+int setup_tcp_connection(char *servername, TCP_context *tcp_ctx)
 {
   char my_hostname[256];
   char *hosts_array[100];
   int right_neighbor_index;
-  // int left_neighbor_index;
-
   get_neighbors(servername, &my_hostname, &hosts_array, &right_neighbor_index);
 
-  int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+  tcp_ctx->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
   int opt = 1;
-  setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+  setsockopt(tcp_ctx->listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
   struct sockaddr_in left_addr;
   left_addr.sin_family = AF_INET;
   left_addr.sin_port = htons(PORT_BASE);
   left_addr.sin_addr.s_addr = INADDR_ANY;
 
-  if (bind(listen_fd, (struct sockaddr *) &left_addr, sizeof(left_addr)) < 0)
+  if (bind(tcp_ctx->listen_fd, (struct sockaddr *) &left_addr, sizeof(left_addr)) < 0)
   {
     perror("bind");
-    close(listen_fd);
+    close(tcp_ctx->listen_fd);
     return EXIT_FAILURE;
   }
 
-  listen(listen_fd, 1);
+  listen(tcp_ctx->listen_fd, 1);
 
   struct addrinfo *right_neighbor_info;
   if (getaddrinfo(hosts_array[right_neighbor_index], NULL, NULL, &right_neighbor_info) != 0)
@@ -193,59 +185,91 @@ int connect_process_group(char *servername, void **pg_handle)
     return EXIT_FAILURE;
   }
 
-  int right_fd = socket(AF_INET, SOCK_STREAM, 0);
+  tcp_ctx->right_fd = socket(AF_INET, SOCK_STREAM, 0);
   struct sockaddr_in *right_addr = (struct sockaddr_in *) right_neighbor_info->ai_addr;
   right_addr->sin_family = AF_INET;
   right_addr->sin_port = htons(PORT_BASE);
 
-  RDMAContext *rdma_context = malloc(sizeof(RDMAContext));
-  memset(rdma_context, 0, sizeof(RDMAContext));
-  if (build_rdma_context(rdma_context) != 0)
+  while (connect(tcp_ctx->right_fd, (struct sockaddr *) right_addr, right_neighbor_info->ai_addrlen) == -1)
+  {
+    sleep(1);
+  }
+  socklen_t addr_len = sizeof(left_addr);
+  tcp_ctx->left_fd = accept(tcp_ctx->listen_fd, (struct sockaddr *) &left_addr, &addr_len);
+  return EXIT_SUCCESS;
+}
+
+int exchange_rdma_info(const TCP_context *tcp_ctx, const RDMAContext *my_ctx, neighbors_rdma_info *neighbors_info)
+{
+  RDMA_exchange_info info_to_neighbors = {my_ctx->lid, my_ctx->qp_from_left->qp_num};
+  write(tcp_ctx->left_fd, &info_to_neighbors, sizeof(info_to_neighbors));
+  write(tcp_ctx->right_fd, &info_to_neighbors, sizeof(info_to_neighbors));
+  read(tcp_ctx->right_fd, &neighbors_info->info_from_right, sizeof(neighbors_info->info_from_right));
+  read(tcp_ctx->left_fd, &neighbors_info->info_from_left, sizeof(neighbors_info->info_from_left));
+  return 0;
+}
+
+int connect_qps_to_rts(const RDMAContext *ctx, const neighbors_rdma_info *neighbors_info)
+{
+  if (modify_qp_to_rts(ctx->qp_from_left, neighbors_info->info_from_left.qp_num, neighbors_info->info_from_left.lid) != 0)
+  {
+    fprintf(stderr, "Failed to modify Left QP to RTS\n");
+    return EXIT_FAILURE;
+  }
+
+  if (modify_qp_to_rts(ctx->qp_to_right, neighbors_info->info_from_right.qp_num, neighbors_info->info_from_right.lid) != 0)
+  {
+    fprintf(stderr, "Failed to modify Right QP to RTS\n");
+    return EXIT_FAILURE;
+  }
+  return EXIT_SUCCESS;
+}
+
+int connect_process_group(char *servername, void **pg_handle)
+{
+  TCP_context tcp_ctx;
+  setup_tcp_connection(servername, &tcp_ctx);
+
+  RDMAContext *my_ctx = malloc(sizeof(RDMAContext));
+  if (my_ctx == NULL)
+  {
+    fprintf(stderr, "Failed to allocate RDMAContext\n");
+    return EXIT_FAILURE;
+  }
+  memset(my_ctx, 0, sizeof(RDMAContext));
+  if (build_rdma_context(my_ctx) != 0)
   {
     fprintf(stderr, "Failed to build RDMA context\n");
     return EXIT_FAILURE;
   }
 
-  RDMA_exchange_info info_to_neighbors = {rdma_context->lid, rdma_context->qp_from_left->qp_num};
-  RDMA_exchange_info info_from_right_neighbor;
-  RDMA_exchange_info info_from_left_neighbor;
+  neighbors_rdma_info neighbors_info = {(RDMA_exchange_info){0}, (RDMA_exchange_info){0}};
 
-  while (connect(right_fd, (struct sockaddr *) right_addr, right_neighbor_info->ai_addrlen) == -1)
-  {
-    sleep(1);
-  }
-  socklen_t addr_len = sizeof(left_addr);
-  int left_fd = accept(listen_fd, (struct sockaddr *) &left_addr, &addr_len);
+  exchange_rdma_info(&tcp_ctx, my_ctx, &neighbors_info);
+  // freeaddrinfo(right_neighbor_info);
 
-  freeaddrinfo(right_neighbor_info);
 
-  write(left_fd, &info_to_neighbors, sizeof(info_to_neighbors));
-  write(right_fd, &info_to_neighbors, sizeof(info_to_neighbors));
-  read(right_fd, &info_from_right_neighbor, sizeof(info_from_right_neighbor));
-  read(left_fd, &info_from_left_neighbor, sizeof(info_from_left_neighbor));
-
+  // todo - delete later!
   printf("Exchange Done!\n");
-  printf("  -> My hostname: %s, I sent to LEFT: LID %d, QPN %d\n", my_hostname, info_to_neighbors.lid, info_to_neighbors.qp_num);
-  printf("  -> My hostname: %s, I sent to RIGHT: LID %d, QPN %d\n", my_hostname, info_to_neighbors.lid, info_to_neighbors.qp_num);
-  printf("  <- My hostname: %s, I got from LEFT: LID %d, QPN %d\n", my_hostname, info_from_left_neighbor.lid, info_from_left_neighbor.qp_num);
-  printf("  <- My hostname: %s, I got from RIGHT: LID %d, QPN %d\n", my_hostname, info_from_right_neighbor.lid, info_from_right_neighbor.qp_num);
+  char my_hostname[256];
+  gethostname(my_hostname, HOSTNAME_MAX);
+  printf("  -> My hostname: %s, I sent to LEFT: LID %d, QPN %d\n", my_hostname, my_ctx->lid, my_ctx->qp_from_left->qp_num);
+  printf("  -> My hostname: %s, I sent to RIGHT: LID %d, QPN %d\n", my_hostname, my_ctx->lid, my_ctx->qp_from_left->qp_num);
+  printf("  <- My hostname: %s, I got from LEFT: LID %d, QPN %d\n", my_hostname, neighbors_info.info_from_left.lid,
+         neighbors_info.info_from_left.qp_num);
+  printf("  <- My hostname: %s, I got from RIGHT: LID %d, QPN %d\n", my_hostname, neighbors_info.info_from_right.lid,
+         neighbors_info.info_from_right.qp_num);
 
-  close(left_fd);
-  close(right_fd);
-  close(listen_fd);
+  close(tcp_ctx.left_fd);
+  close(tcp_ctx.right_fd);
+  close(tcp_ctx.listen_fd);
 
-  if (modify_qp_to_rts(rdma_context->qp_from_left, info_from_left_neighbor.qp_num, info_from_left_neighbor.lid) != 0)
+  if (connect_qps_to_rts(my_ctx, &neighbors_info) != 0)
   {
-    fprintf(stderr, "Failed to modify Left QP to RTS\n");
     return EXIT_FAILURE;
   }
-  if (modify_qp_to_rts(rdma_context->qp_to_right, info_from_right_neighbor.qp_num, info_from_right_neighbor.lid) != 0)
-  {
-    fprintf(stderr, "Failed to modify Right QP to RTS\n");
-    return EXIT_FAILURE;
-  }
 
-  *pg_handle = rdma_context;
+  *pg_handle = my_ctx;
 
   return 0;
 }

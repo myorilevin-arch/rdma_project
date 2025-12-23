@@ -19,6 +19,11 @@ typedef struct RDMAContext
   uint8_t port_num;
 } RDMAContext;
 
+typedef struct TCP_context{
+  int listen_fd;
+  int left_fd;
+  int right_fd;
+} TCP_context;
 
 typedef struct RDMA_exchange_info {
   uint16_t lid;
@@ -26,6 +31,15 @@ typedef struct RDMA_exchange_info {
 } RDMA_exchange_info;
 
 
+typedef struct neighbors_rdma_info {
+  RDMA_exchange_info info_from_left;
+  RDMA_exchange_info info_from_right;  
+} neighbors_rdma_info;
+
 int connect_process_group(char *servername, void **pg_handle);
+
+// int pg_all_reduce(void *sendbuf, void *recvbuf, int count, DATATYPE datatype, OPERATION op, void *pg_handle);
+// int pg_close(void *pg_handle); /* Destroys the QP */
+
 
 #endif //EX3_RDMA_LIB_H
