@@ -6,8 +6,8 @@
 #include <unistd.h>
 #include <sys/socket.h>
 
-
-typedef struct neighbor_info {
+typedef struct neighbor_info
+{
   char *server_name;
   char *my_hostname;
   char **hosts_array;
@@ -16,8 +16,7 @@ typedef struct neighbor_info {
   int servers_count;
 } neighbors_info;
 
-// void get_neighbors(const char *servername, char my_hostname[256], char *hosts_array[100], int *right_neighbor_index)
-void get_neighbors(neighbors_info* info)
+void get_neighbors(neighbors_info *info)
 {
   gethostname(info->my_hostname, HOSTNAME_MAX);
   char *servername_copy = strdup(info->server_name);
@@ -162,7 +161,7 @@ int modify_qp_to_rts(struct ibv_qp *qp, uint32_t remote_qpn, uint16_t remote_lid
   return EXIT_SUCCESS;
 }
 
-int setup_tcp_connection(char *servername, TCP_context *tcp_ctx, neighbors_info * info)
+int setup_tcp_connection(char *servername, TCP_context *tcp_ctx, neighbors_info *info)
 {
   char my_hostname[256];
   char *hosts_array[100];
@@ -405,8 +404,27 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int obj_count, DATATYPE data
     };
     ibv_post_send(pg->qp_to_right, &send_wr, NULL);
 
-    ibv_poll_cq(pg->cq, 2, NULL);
+    struct ibv_wc wc[2];
+    int completions = 0;
+    while (completions < 2)
+    {
+      int ne = ibv_poll_cq(pg->cq, 2 - completions, &wc[completions]);
+      if (ne < 0)
+      {
+        fprintf(stderr, "Failed to poll CQ\n");
+        return EXIT_FAILURE;
+      }
+      completions += ne;
+    }
 
+    for (int j = 0; j < completions; j++)
+    {
+      if (wc[j].status != IBV_WC_SUCCESS)
+      {
+        fprintf(stderr, "Work completion error: %s\n", ibv_wc_status_str(wc[j].status));
+        return EXIT_FAILURE;
+      }
+    }
     perform_operation(datatype, op, (char *) recvbuf + recv_offset, temp_incoming_buf, elements_per_chank);
   }
 
