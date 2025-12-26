@@ -387,7 +387,7 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int obj_count, DATATYPE data
     free(temp_incoming_buf);
     return EXIT_FAILURE;
   }
-  for (int i = 0; i < pg->servers_num; i++)
+  for (int i = 0; i < pg->servers_num - 1; i++)
   {
     int send_index = (pg->my_index - i + pg->servers_num) % pg->servers_num;
     int recv_index = (pg->my_index - i - 1 + pg->servers_num) % pg->servers_num;
