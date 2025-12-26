@@ -357,9 +357,12 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int obj_count, DATATYPE data
     fprintf(stderr, "Failed to register memory region for recv\n");
     return EXIT_FAILURE;
   }
-  int chunk_size = obj_count / pg->servers_num;
-  char temp_incoming_buf[chunk_size * sizeof_datatype(datatype)];
-  struct ibv_mr *mr_temp = ibv_reg_mr(pg->pd, temp_incoming_buf, chunk_size * sizeof_datatype(datatype),
+  size_t elements_per_chank = obj_count / pg->servers_num;
+  size_t type_size = sizeof_datatype(datatype);
+  size_t chunk_size_in_bytes = elements_per_chank * type_size;
+  void* temp_incoming_buf[chunk_size_in_bytes];
+
+  struct ibv_mr *mr_temp = ibv_reg_mr(pg->pd, temp_incoming_buf, chunk_size_in_bytes,
                                       IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
   if (!mr_temp)
   {
@@ -371,21 +374,32 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int obj_count, DATATYPE data
     int send_index = (pg->my_index - i + pg->servers_num) % pg->servers_num;
     int recv_index = (pg->my_index - i - 1 + pg->servers_num) % pg->servers_num;
 
+    size_t send_offset = send_index * chunk_size_in_bytes;
+    size_t recv_offset = recv_index * chunk_size_in_bytes;
+
     // Post receive
-    struct ibv_sge recv_sge = {.addr = (uintptr_t) (temp_incoming_buf), .length = chunk_size * sizeof_datatype(datatype), .lkey = mr_temp->lkey};
+    struct ibv_sge recv_sge = {.addr = (uintptr_t) (temp_incoming_buf), .length = chunk_size_in_bytes, .lkey = mr_temp->lkey};
     struct ibv_recv_wr recv_wr = {.wr_id = 1, .next = NULL, .sg_list = &recv_sge, .num_sge = 1};
     ibv_post_recv(pg->qp_from_left, &recv_wr, NULL);
 
     // Post send
+    void* send_address = (char *)recvbuf + send_offset;
     struct ibv_sge send_sge = {
-      .addr = (uintptr_t) (recvbuf) + send_index * chunk_size * sizeof_datatype(datatype), .length = chunk_size * sizeof_datatype(datatype),
+      .addr = (uintptr_t) (send_address), .length = chunk_size_in_bytes,
       .lkey = mr_recv->lkey
     };
     struct ibv_send_wr send_wr = {
       .wr_id = 2, .next = NULL, .sg_list = &send_sge, .num_sge = 1, .opcode = IBV_WR_SEND, .send_flags = IBV_SEND_SIGNALED
     };
     ibv_post_send(pg->qp_to_right, &send_wr, NULL);
+
+    ibv_poll_cq(pg->cq, 2, NULL);
+
+    perform_operation(datatype, op, (char*)recvbuf + recv_offset, temp_incoming_buf, elements_per_chank);
   }
+
+  ibv_dereg_mr(mr_recv);
+  ibv_dereg_mr(mr_temp);
 
   return EXIT_SUCCESS;
 }
