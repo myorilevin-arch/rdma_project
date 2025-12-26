@@ -6,27 +6,36 @@
 #include <unistd.h>
 #include <sys/socket.h>
 
-void get_neighbors(const char *servername, char (*my_hostname)[256], char *(*hosts_array)[100], int *right_neighbor_index)
+
+typedef struct neighbor_info {
+  char *server_name;
+  char *my_hostname;
+  char **hosts_array;
+  int right_neighbor_index;
+  int my_index;
+  int servers_count;
+} neighbors_info;
+
+// void get_neighbors(const char *servername, char my_hostname[256], char *hosts_array[100], int *right_neighbor_index)
+void get_neighbors(neighbors_info* info)
 {
-  gethostname(*my_hostname, HOSTNAME_MAX);
-  char *servername_copy = strdup(servername);
-  int servers_count = 0;
+  gethostname(info->my_hostname, HOSTNAME_MAX);
+  char *servername_copy = strdup(info->server_name);
   char *host = strtok(servername_copy, " ");
   while (host != NULL)
   {
-    (*hosts_array)[servers_count++] = host;
+    info->hosts_array[info->servers_count++] = host;
     host = strtok(NULL, " ");
   }
-  unsigned int my_hostname_index = -1;
-  for (int i = 0; i < servers_count; i++)
+  for (int i = 0; i < info->servers_count; i++)
   {
-    if (strcmp((*hosts_array)[i], *my_hostname) == 0)
+    if (strcmp(info->hosts_array[i], info->my_hostname) == 0)
     {
-      my_hostname_index = i;
+      info->my_index = i;
       break;
     }
   }
-  *right_neighbor_index = (my_hostname_index + 1) % servers_count;
+  info->right_neighbor_index = (info->my_index + 1) % info->servers_count;
 }
 
 int build_rdma_context(RDMAContext *context)
@@ -153,12 +162,13 @@ int modify_qp_to_rts(struct ibv_qp *qp, uint32_t remote_qpn, uint16_t remote_lid
   return EXIT_SUCCESS;
 }
 
-int setup_tcp_connection(char *servername, TCP_context *tcp_ctx)
+int setup_tcp_connection(char *servername, TCP_context *tcp_ctx, neighbors_info * info)
 {
   char my_hostname[256];
   char *hosts_array[100];
-  int right_neighbor_index;
-  get_neighbors(servername, &my_hostname, &hosts_array, &right_neighbor_index);
+
+  *info = (neighbors_info){servername, my_hostname, hosts_array, -1, -1, 0};
+  get_neighbors(info);
 
   tcp_ctx->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
   int opt = 1;
@@ -179,9 +189,9 @@ int setup_tcp_connection(char *servername, TCP_context *tcp_ctx)
   listen(tcp_ctx->listen_fd, 1);
 
   struct addrinfo *right_neighbor_info;
-  if (getaddrinfo(hosts_array[right_neighbor_index], NULL, NULL, &right_neighbor_info) != 0)
+  if (getaddrinfo(hosts_array[info->right_neighbor_index], NULL, NULL, &right_neighbor_info) != 0)
   {
-    fprintf(stderr, "Failed to get address info for right neighbor %s\n", hosts_array[right_neighbor_index]);
+    fprintf(stderr, "Failed to get address info for right neighbor %s\n", hosts_array[info->right_neighbor_index]);
     return EXIT_FAILURE;
   }
 
@@ -227,9 +237,6 @@ int connect_qps_to_rts(const RDMAContext *ctx, const neighbors_rdma_info *neighb
 
 int connect_process_group(char *servername, void **pg_handle)
 {
-  TCP_context tcp_ctx;
-  setup_tcp_connection(servername, &tcp_ctx);
-
   RDMAContext *my_ctx = malloc(sizeof(RDMAContext));
   if (my_ctx == NULL)
   {
@@ -237,6 +244,11 @@ int connect_process_group(char *servername, void **pg_handle)
     return EXIT_FAILURE;
   }
   memset(my_ctx, 0, sizeof(RDMAContext));
+  TCP_context tcp_ctx;
+  neighbors_info info;
+  setup_tcp_connection(servername, &tcp_ctx, &info);
+  my_ctx->my_index = info.my_index;
+  my_ctx->servers_num = info.servers_count;
   if (build_rdma_context(my_ctx) != 0)
   {
     fprintf(stderr, "Failed to build RDMA context\n");
@@ -360,7 +372,7 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int obj_count, DATATYPE data
   size_t elements_per_chank = obj_count / pg->servers_num;
   size_t type_size = sizeof_datatype(datatype);
   size_t chunk_size_in_bytes = elements_per_chank * type_size;
-  void* temp_incoming_buf[chunk_size_in_bytes];
+  void *temp_incoming_buf[chunk_size_in_bytes];
 
   struct ibv_mr *mr_temp = ibv_reg_mr(pg->pd, temp_incoming_buf, chunk_size_in_bytes,
                                       IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
@@ -383,7 +395,7 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int obj_count, DATATYPE data
     ibv_post_recv(pg->qp_from_left, &recv_wr, NULL);
 
     // Post send
-    void* send_address = (char *)recvbuf + send_offset;
+    void *send_address = (char *) recvbuf + send_offset;
     struct ibv_sge send_sge = {
       .addr = (uintptr_t) (send_address), .length = chunk_size_in_bytes,
       .lkey = mr_recv->lkey
@@ -395,7 +407,7 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int obj_count, DATATYPE data
 
     ibv_poll_cq(pg->cq, 2, NULL);
 
-    perform_operation(datatype, op, (char*)recvbuf + recv_offset, temp_incoming_buf, elements_per_chank);
+    perform_operation(datatype, op, (char *) recvbuf + recv_offset, temp_incoming_buf, elements_per_chank);
   }
 
   ibv_dereg_mr(mr_recv);
