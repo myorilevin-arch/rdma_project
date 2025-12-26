@@ -210,9 +210,10 @@ int setup_tcp_connection(char *servername, TCP_context *tcp_ctx, neighbors_info 
 
 int exchange_rdma_info(const TCP_context *tcp_ctx, const RDMAContext *my_ctx, neighbors_rdma_info *neighbors_info)
 {
-  RDMA_exchange_info info_to_neighbors = {my_ctx->lid, my_ctx->qp_from_left->qp_num};
-  write(tcp_ctx->left_fd, &info_to_neighbors, sizeof(info_to_neighbors));
-  write(tcp_ctx->right_fd, &info_to_neighbors, sizeof(info_to_neighbors));
+  RDMA_exchange_info info_to_left = {my_ctx->lid, my_ctx->qp_from_left->qp_num};
+  RDMA_exchange_info info_to_right = {my_ctx->lid, my_ctx->qp_to_right->qp_num};
+  write(tcp_ctx->left_fd, &info_to_left, sizeof(info_to_left));
+  write(tcp_ctx->right_fd, &info_to_right, sizeof(info_to_right));
   read(tcp_ctx->right_fd, &neighbors_info->info_from_right, sizeof(neighbors_info->info_from_right));
   read(tcp_ctx->left_fd, &neighbors_info->info_from_left, sizeof(neighbors_info->info_from_left));
   return 0;
@@ -371,13 +372,19 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int obj_count, DATATYPE data
   size_t elements_per_chank = obj_count / pg->servers_num;
   size_t type_size = sizeof_datatype(datatype);
   size_t chunk_size_in_bytes = elements_per_chank * type_size;
-  void *temp_incoming_buf[chunk_size_in_bytes];
+  void *temp_incoming_buf = malloc(chunk_size_in_bytes);
+  if (!temp_incoming_buf)
+  {
+    fprintf(stderr, "Failed to allocate temp buffer\n");
+    return EXIT_FAILURE;
+  }
 
   struct ibv_mr *mr_temp = ibv_reg_mr(pg->pd, temp_incoming_buf, chunk_size_in_bytes,
                                       IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
   if (!mr_temp)
   {
     fprintf(stderr, "Failed to register memory region for temp buffer\n");
+    free(temp_incoming_buf);
     return EXIT_FAILURE;
   }
   for (int i = 0; i < pg->servers_num; i++)
@@ -412,6 +419,7 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int obj_count, DATATYPE data
       if (ne < 0)
       {
         fprintf(stderr, "Failed to poll CQ\n");
+        free(temp_incoming_buf);
         return EXIT_FAILURE;
       }
       completions += ne;
@@ -422,12 +430,14 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int obj_count, DATATYPE data
       if (wc[j].status != IBV_WC_SUCCESS)
       {
         fprintf(stderr, "Work completion error: %s\n", ibv_wc_status_str(wc[j].status));
+        free(temp_incoming_buf);
         return EXIT_FAILURE;
       }
     }
     perform_operation(datatype, op, (char *) recvbuf + recv_offset, temp_incoming_buf, elements_per_chank);
   }
 
+  free(temp_incoming_buf);
   ibv_dereg_mr(mr_recv);
   ibv_dereg_mr(mr_temp);
 
