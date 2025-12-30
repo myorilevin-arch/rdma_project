@@ -363,15 +363,17 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int obj_count, DATATYPE data
     memccpy(recvbuf, sendbuf, '\0', obj_count * sizeof_datatype(datatype));
   }
   RDMAContext *pg = (RDMAContext *) pg_handle;
+
+  // TODO - optimize memory registration - register once at the beginning of the program
   struct ibv_mr *mr_recv = ibv_reg_mr(pg->pd, recvbuf, obj_count * sizeof_datatype(datatype), IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
   if (!mr_recv)
   {
     fprintf(stderr, "Failed to register memory region for recv\n");
     return EXIT_FAILURE;
   }
-  size_t elements_per_chank = obj_count / pg->servers_num;
+  size_t elements_per_chunk = obj_count / pg->servers_num;
   size_t type_size = sizeof_datatype(datatype);
-  size_t chunk_size_in_bytes = elements_per_chank * type_size;
+  size_t chunk_size_in_bytes = elements_per_chunk * type_size;
   void *temp_incoming_buf = malloc(chunk_size_in_bytes);
   if (!temp_incoming_buf)
   {
@@ -379,6 +381,7 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int obj_count, DATATYPE data
     return EXIT_FAILURE;
   }
 
+  // TODO - optimize memory registration - register once at the beginning of the program if possible
   struct ibv_mr *mr_temp = ibv_reg_mr(pg->pd, temp_incoming_buf, chunk_size_in_bytes,
                                       IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
   if (!mr_temp)
@@ -434,12 +437,81 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int obj_count, DATATYPE data
         return EXIT_FAILURE;
       }
     }
-    perform_operation(datatype, op, (char *) recvbuf + recv_offset, temp_incoming_buf, elements_per_chank);
+    perform_operation(datatype, op, (char *) recvbuf + recv_offset, temp_incoming_buf, elements_per_chunk);
   }
 
   free(temp_incoming_buf);
   ibv_dereg_mr(mr_recv);
   ibv_dereg_mr(mr_temp);
 
+  return EXIT_SUCCESS;
+}
+
+int pg_all_gather(void *sendbuf, void *recvbuf, int obj_count,
+                  DATATYPE datatype, OPERATION op, void *pg_handle)
+{
+  RDMAContext *pg = (RDMAContext *) pg_handle;
+
+  struct ibv_mr *mr_recv = ibv_reg_mr(pg->pd, recvbuf, obj_count * sizeof_datatype(datatype), IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+
+  size_t elements_per_chunk = obj_count / pg->servers_num;
+  size_t type_size = sizeof_datatype(datatype);
+  size_t chunk_size_in_bytes = elements_per_chunk * type_size;
+
+  for (int i = 0; i < pg->servers_num; i++)
+  {
+    int send_index = (pg->my_index - i + 1) % pg->servers_num;
+    int recv_index = (pg->my_index - i) % pg->servers_num;
+
+    size_t send_offset = send_index * chunk_size_in_bytes;
+    size_t recv_offset = recv_index * chunk_size_in_bytes;
+
+    // Post Receive
+    struct ibv_sge recv_sge = {.addr = (uintptr_t) ((char *) recvbuf + recv_offset), .length = chunk_size_in_bytes, .lkey = mr_recv->lkey};
+    struct ibv_recv_wr recv_wr = {.wr_id = 1, .next = NULL, .sg_list = &recv_sge, .num_sge = 1};
+    ibv_post_recv(pg->qp_from_left, &recv_wr, NULL);
+
+    // Post Send
+    struct ibv_sge send_sge = {.addr = (uintptr_t) ((char *) recvbuf + send_offset), .length = chunk_size_in_bytes, .lkey = mr_recv->lkey};
+    struct ibv_send_wr send_wr = {
+      .wr_id = 2, .next = NULL, .sg_list = &send_sge, .num_sge = 1, .opcode = IBV_WR_SEND, .send_flags = IBV_SEND_SIGNALED
+    };
+    ibv_post_send(pg->qp_to_right, &send_wr, NULL);
+  }
+  struct ibv_wc wc[2];
+  int completions = 0;
+  while (completions < 2)
+  {
+    int ne = ibv_poll_cq(pg->cq, 2 - completions, &wc[completions]);
+    if (ne < 0)
+    {
+      fprintf(stderr, "Failed to poll CQ\n");
+      return EXIT_FAILURE;
+    }
+    completions += ne;
+  }
+
+  for (int j = 0; j < completions; j++)
+  {
+    if (wc[j].status != IBV_WC_SUCCESS)
+    {
+      fprintf(stderr, "Work completion error: %s\n", ibv_wc_status_str(wc[j].status));
+      return EXIT_FAILURE;
+    }
+  }
+  ibv_dereg_mr(mr_recv);
+  return EXIT_SUCCESS;
+}
+
+int pg_all_reduce(void *sendbuf, void *recvbuf, int count, DATATYPE datatype, OPERATION op, void *pg_handle)
+{
+  if (pg_reduce_scatter(sendbuf, recvbuf, count, datatype, op, pg_handle)) != 0)
+  {
+    return EXIT_FAILURE;
+  }
+  if (pg_all_gather(recvbuf, recvbuf, count, datatype, op, pg_handle) != 0)
+  {
+    return EXIT_FAILURE;
+  }
   return EXIT_SUCCESS;
 }
