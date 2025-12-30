@@ -1,5 +1,6 @@
 #include "rdma_lib.h"
 #include <netdb.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -258,18 +259,6 @@ int connect_process_group(char *servername, void **pg_handle)
   neighbors_rdma_info neighbors_info = {(RDMA_exchange_info){0}, (RDMA_exchange_info){0}};
 
   exchange_rdma_info(&tcp_ctx, my_ctx, &neighbors_info);
-  // freeaddrinfo(right_neighbor_info);
-
-  // todo - delete later!
-  printf("Exchange Done!\n");
-  char my_hostname[256];
-  gethostname(my_hostname, HOSTNAME_MAX);
-  printf("  -> My hostname: %s, I sent to LEFT: LID %d, QPN %d\n", my_hostname, my_ctx->lid, my_ctx->qp_from_left->qp_num);
-  printf("  -> My hostname: %s, I sent to RIGHT: LID %d, QPN %d\n", my_hostname, my_ctx->lid, my_ctx->qp_from_left->qp_num);
-  printf("  <- My hostname: %s, I got from LEFT: LID %d, QPN %d\n", my_hostname, neighbors_info.info_from_left.lid,
-         neighbors_info.info_from_left.qp_num);
-  printf("  <- My hostname: %s, I got from RIGHT: LID %d, QPN %d\n", my_hostname, neighbors_info.info_from_right.lid,
-         neighbors_info.info_from_right.qp_num);
 
   close(tcp_ctx.left_fd);
   close(tcp_ctx.right_fd);
@@ -285,7 +274,6 @@ int connect_process_group(char *servername, void **pg_handle)
   return 0;
 }
 
-// TODO - check if conversion can be done once at the beginning of the function rather than before each operation
 void perform_operation(DATATYPE datatype, OPERATION op, void *recv_buf, void *incoming_buf, int count)
 {
   switch (datatype)
@@ -363,33 +351,45 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int obj_count, DATATYPE data
     memccpy(recvbuf, sendbuf, '\0', obj_count * sizeof_datatype(datatype));
   }
   RDMAContext *pg = (RDMAContext *) pg_handle;
+  size_t elements_per_chunk = obj_count / pg->servers_num;
+  size_t type_size = sizeof_datatype(datatype);
+  size_t chunk_size_in_bytes = elements_per_chunk * type_size;
 
-  // TODO - optimize memory registration - register once at the beginning of the program
-  struct ibv_mr *mr_recv = ibv_reg_mr(pg->pd, recvbuf, obj_count * sizeof_datatype(datatype), IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+  struct ibv_mr *mr_recv = ibv_reg_mr(pg->pd, recvbuf, obj_count * type_size, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
   if (!mr_recv)
   {
     fprintf(stderr, "Failed to register memory region for recv\n");
     return EXIT_FAILURE;
   }
-  size_t elements_per_chunk = obj_count / pg->servers_num;
-  size_t type_size = sizeof_datatype(datatype);
-  size_t chunk_size_in_bytes = elements_per_chunk * type_size;
-  void *temp_incoming_buf = malloc(chunk_size_in_bytes);
-  if (!temp_incoming_buf)
+
+  void *double_buffer = malloc(chunk_size_in_bytes * 2);
+  if (!double_buffer)
   {
-    fprintf(stderr, "Failed to allocate temp buffer\n");
+    fprintf(stderr, "Failed to allocate double buffer\n");
+    ibv_dereg_mr(mr_recv);
     return EXIT_FAILURE;
   }
+  void *temp_incoming_bufs[2];
+  temp_incoming_bufs[0] = double_buffer;
+  temp_incoming_bufs[1] = (char *) double_buffer + chunk_size_in_bytes;
 
-  // TODO - optimize memory registration - register once at the beginning of the program if possible
-  struct ibv_mr *mr_temp = ibv_reg_mr(pg->pd, temp_incoming_buf, chunk_size_in_bytes,
+  struct ibv_mr *mr_temp = ibv_reg_mr(pg->pd, double_buffer, chunk_size_in_bytes * 2,
                                       IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
   if (!mr_temp)
   {
     fprintf(stderr, "Failed to register memory region for temp buffer\n");
-    free(temp_incoming_buf);
+    free(double_buffer);
     return EXIT_FAILURE;
   }
+
+  int send_base = 1000;
+  int recv_base = 2000;
+
+  // Post receive
+  struct ibv_sge recv_sge = {.addr = (uintptr_t) (temp_incoming_bufs[0]), .length = chunk_size_in_bytes, .lkey = mr_temp->lkey};
+  struct ibv_recv_wr recv_wr = {.wr_id = recv_base, .next = NULL, .sg_list = &recv_sge, .num_sge = 1};
+  ibv_post_recv(pg->qp_from_left, &recv_wr, NULL);
+
   for (int i = 0; i < pg->servers_num - 1; i++)
   {
     int send_index = (pg->my_index - i + pg->servers_num) % pg->servers_num;
@@ -398,10 +398,8 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int obj_count, DATATYPE data
     size_t send_offset = send_index * chunk_size_in_bytes;
     size_t recv_offset = recv_index * chunk_size_in_bytes;
 
-    // Post receive
-    struct ibv_sge recv_sge = {.addr = (uintptr_t) (temp_incoming_buf), .length = chunk_size_in_bytes, .lkey = mr_temp->lkey};
-    struct ibv_recv_wr recv_wr = {.wr_id = 1, .next = NULL, .sg_list = &recv_sge, .num_sge = 1};
-    ibv_post_recv(pg->qp_from_left, &recv_wr, NULL);
+    int cur_index = i % 2;
+    int next_index = (i + 1) % 2;
 
     // Post send
     void *send_address = (char *) recvbuf + send_offset;
@@ -410,37 +408,48 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int obj_count, DATATYPE data
       .lkey = mr_recv->lkey
     };
     struct ibv_send_wr send_wr = {
-      .wr_id = 2, .next = NULL, .sg_list = &send_sge, .num_sge = 1, .opcode = IBV_WR_SEND, .send_flags = IBV_SEND_SIGNALED
+      .wr_id = i + send_base, .next = NULL, .sg_list = &send_sge, .num_sge = 1, .opcode = IBV_WR_SEND, .send_flags = IBV_SEND_SIGNALED
     };
     ibv_post_send(pg->qp_to_right, &send_wr, NULL);
 
-    struct ibv_wc wc[2];
-    int completions = 0;
-    while (completions < 2)
+    if (i < pg->servers_num - 2)
     {
-      int ne = ibv_poll_cq(pg->cq, 2 - completions, &wc[completions]);
-      if (ne < 0)
+      // Post receive for next iteration
+      struct ibv_sge recv_sge_next = {.addr = (uintptr_t) (temp_incoming_bufs[next_index]), .length = chunk_size_in_bytes, .lkey = mr_temp->lkey};
+      struct ibv_recv_wr recv_wr_next = {.wr_id = i + 1 + recv_base, .next = NULL, .sg_list = &recv_sge_next, .num_sge = 1};
+      ibv_post_recv(pg->qp_from_left, &recv_wr_next, NULL);
+    }
+    // // Post receive
+    // struct ibv_sge recv_sge = {.addr = (uintptr_t) (temp_incoming_buf), .length = chunk_size_in_bytes, .lkey = mr_temp->lkey};
+    // struct ibv_recv_wr recv_wr = {.wr_id = 1, .next = NULL, .sg_list = &recv_sge, .num_sge = 1};
+    // ibv_post_recv(pg->qp_from_left, &recv_wr, NULL);
+
+    struct ibv_wc wc;
+    bool data_arrived[pg->servers_num - 1];
+    memset(data_arrived, false, sizeof(data_arrived));
+    while (!data_arrived[i])
+    {
+      int ne = ibv_poll_cq(pg->cq, 1, &wc);
+      if (ne > 0)
       {
-        fprintf(stderr, "Failed to poll CQ\n");
-        free(temp_incoming_buf);
-        return EXIT_FAILURE;
+        if (wc.status != IBV_WC_SUCCESS)
+        {
+          fprintf(stderr, "Work completion error: %s\n", ibv_wc_status_str(wc.status));
+          free(double_buffer);
+          return EXIT_FAILURE;
+        }
+        if (wc.opcode == IBV_WC_RECV)
+        {
+            data_arrived[wc.wr_id - recv_base] = true;
+        }
       }
-      completions += ne;
     }
 
-    for (int j = 0; j < completions; j++)
-    {
-      if (wc[j].status != IBV_WC_SUCCESS)
-      {
-        fprintf(stderr, "Work completion error: %s\n", ibv_wc_status_str(wc[j].status));
-        free(temp_incoming_buf);
-        return EXIT_FAILURE;
-      }
-    }
-    perform_operation(datatype, op, (char *) recvbuf + recv_offset, temp_incoming_buf, elements_per_chunk);
+    perform_operation(datatype, op, (char *) recvbuf + recv_offset, temp_incoming_bufs[cur_index], elements_per_chunk);
   }
 
-  free(temp_incoming_buf);
+  ibv_poll_cq(pg->cq, 0, NULL); // drain any remaining completions
+  free(double_buffer);
   ibv_dereg_mr(mr_recv);
   ibv_dereg_mr(mr_temp);
 
@@ -458,10 +467,10 @@ int pg_all_gather(void *sendbuf, void *recvbuf, int obj_count,
   size_t type_size = sizeof_datatype(datatype);
   size_t chunk_size_in_bytes = elements_per_chunk * type_size;
 
-  for (int i = 0; i < pg->servers_num; i++)
+  for (int i = 0; i < pg->servers_num - 1; i++)
   {
-    int send_index = (pg->my_index - i + 1) % pg->servers_num;
-    int recv_index = (pg->my_index - i) % pg->servers_num;
+    int send_index = (pg->my_index - i + 1 + pg->servers_num) % pg->servers_num;
+    int recv_index = (pg->my_index - i + pg->servers_num) % pg->servers_num;
 
     size_t send_offset = send_index * chunk_size_in_bytes;
     size_t recv_offset = recv_index * chunk_size_in_bytes;
@@ -477,26 +486,26 @@ int pg_all_gather(void *sendbuf, void *recvbuf, int obj_count,
       .wr_id = 2, .next = NULL, .sg_list = &send_sge, .num_sge = 1, .opcode = IBV_WR_SEND, .send_flags = IBV_SEND_SIGNALED
     };
     ibv_post_send(pg->qp_to_right, &send_wr, NULL);
-  }
-  struct ibv_wc wc[2];
-  int completions = 0;
-  while (completions < 2)
-  {
-    int ne = ibv_poll_cq(pg->cq, 2 - completions, &wc[completions]);
-    if (ne < 0)
+    struct ibv_wc wc[2];
+    int completions = 0;
+    while (completions < 2)
     {
-      fprintf(stderr, "Failed to poll CQ\n");
-      return EXIT_FAILURE;
+      int ne = ibv_poll_cq(pg->cq, 2 - completions, &wc[completions]);
+      if (ne < 0)
+      {
+        fprintf(stderr, "Failed to poll CQ\n");
+        return EXIT_FAILURE;
+      }
+      completions += ne;
     }
-    completions += ne;
-  }
 
-  for (int j = 0; j < completions; j++)
-  {
-    if (wc[j].status != IBV_WC_SUCCESS)
+    for (int j = 0; j < completions; j++)
     {
-      fprintf(stderr, "Work completion error: %s\n", ibv_wc_status_str(wc[j].status));
-      return EXIT_FAILURE;
+      if (wc[j].status != IBV_WC_SUCCESS)
+      {
+        fprintf(stderr, "Work completion error: %s\n", ibv_wc_status_str(wc[j].status));
+        return EXIT_FAILURE;
+      }
     }
   }
   ibv_dereg_mr(mr_recv);
@@ -505,7 +514,7 @@ int pg_all_gather(void *sendbuf, void *recvbuf, int obj_count,
 
 int pg_all_reduce(void *sendbuf, void *recvbuf, int count, DATATYPE datatype, OPERATION op, void *pg_handle)
 {
-  if (pg_reduce_scatter(sendbuf, recvbuf, count, datatype, op, pg_handle)) != 0)
+  if (pg_reduce_scatter(sendbuf, recvbuf, count, datatype, op, pg_handle) != 0)
   {
     return EXIT_FAILURE;
   }
@@ -513,5 +522,17 @@ int pg_all_reduce(void *sendbuf, void *recvbuf, int count, DATATYPE datatype, OP
   {
     return EXIT_FAILURE;
   }
+  return EXIT_SUCCESS;
+}
+
+int pg_close(void *pg_handle)
+{
+  RDMAContext *pg = (RDMAContext *) pg_handle;
+  ibv_destroy_qp(pg->qp_to_right);
+  ibv_destroy_qp(pg->qp_from_left);
+  ibv_destroy_cq(pg->cq);
+  ibv_dealloc_pd(pg->pd);
+  ibv_close_device(pg->ctx);
+  free(pg);
   return EXIT_SUCCESS;
 }

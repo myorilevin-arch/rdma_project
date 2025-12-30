@@ -3,7 +3,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 
-#define VECTOR_SIZE 4
+#define VECTOR_SIZE 10000
 
 int main(int argc, char *argv[])
 {
@@ -25,7 +25,7 @@ int main(int argc, char *argv[])
     data_buf[i] = fill_value;
   }
 
-  printf("Input: [ %d, %d, %d, %d ]\n", data_buf[0], data_buf[1], data_buf[2], data_buf[3]);
+  // printf("Input: [ %d, %d, %d, %d ]\n", data_buf[0], data_buf[1], data_buf[2], data_buf[3]);
 
   int ret = pg_all_reduce(data_buf, data_buf, VECTOR_SIZE, INT, SUM, pg);
 
@@ -35,9 +35,17 @@ int main(int argc, char *argv[])
     return EXIT_FAILURE;
   }
 
-  printf("Output: [ %d, %d, %d, %d ]\n", data_buf[0], data_buf[1], data_buf[2], data_buf[3]);
+  // printf("Output: [ %d, %d, %d, %d ]\n", data_buf[0], data_buf[1], data_buf[2], data_buf[3])
+  for (int i = 0; i < VECTOR_SIZE; i++)
+  {
+    if (data_buf[i] != 10)
+    {
+      fprintf(stderr, "Rank %d: Error at index %d, expected 10 but got %d\n", pg->my_index, i, data_buf[i]);
+      return EXIT_FAILURE;
+    }
+  }
+  printf("Rank %d: All-reduce completed successfully.\n", pg->my_index);
 
-  free(pg);
-
+  pg_close(pg);
   return 0;
 }

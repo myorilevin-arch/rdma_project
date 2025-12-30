@@ -62,6 +62,6 @@ int pg_all_gather(void *sendbuf, void *recvbuf, int count,
 
 int pg_all_reduce(void *sendbuf, void *recvbuf, int count, DATATYPE datatype, OPERATION op, void *pg_handle);
 
-// int pg_close(void *pg_handle); /* Destroys the QP */
+int pg_close(void *pg_handle); /* Destroys the QP */
 
 #endif //EX3_RDMA_LIB_H
